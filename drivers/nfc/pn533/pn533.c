@@ -2176,6 +2176,8 @@ _error:
  */
 void pn533_recv_frame(struct pn533 *dev, struct sk_buff *skb, int status)
 {
+	int frame_size;
+
 	if (!dev->cmd)
 		goto sched_wq;
 
@@ -2197,8 +2199,18 @@ void pn533_recv_frame(struct pn533 *dev, struct sk_buff *skb, int status)
 		return;
 	}
 
+	frame_size = dev->ops->rx_frame_size(skb->data);
+	if (frame_size > skb->len) {
+		nfc_err(dev->dev, "Received truncated frame\n");
+		dev->cmd->status = -EIO;
+		dev_kfree_skb(skb);
+		goto sched_wq;
+	}
+
+	skb_trim(skb, frame_size);
+
 	print_hex_dump_debug("PN533 RX: ", DUMP_PREFIX_NONE, 16, 1, skb->data,
-			     dev->ops->rx_frame_size(skb->data), false);
+			     frame_size, false);
 
 	if (!dev->ops->rx_is_frame_valid(skb->data, dev)) {
 		nfc_err(dev->dev, "Received an invalid frame\n");
