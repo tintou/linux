@@ -30,6 +30,15 @@
 #define ACS_VENDOR_ID 0x072f
 #define ACR122U_PRODUCT_ID 0x2200
 
+#define NSR106_VENDOR_ID    0x0416
+#define NSR106_PRODUCT_ID_B008 0xb008
+#define NSR106_PRODUCT_ID_B029 0xb029
+#define NSR106_PRODUCT_ID_B030 0xb030
+#define NSR106_PRODUCT_ID_B058 0xb058
+
+/* NSR106 uses 64-byte fixed-size HID interrupt transfers */
+#define NSR106_FRAME_SIZE 64
+
 static const struct usb_device_id pn533_usb_table[] = {
 	{ USB_DEVICE(PN533_VENDOR_ID, PN533_PRODUCT_ID),
 	  .driver_info = PN533_DEVICE_STD },
@@ -39,9 +48,47 @@ static const struct usb_device_id pn533_usb_table[] = {
 	  .driver_info = PN533_DEVICE_PASORI },
 	{ USB_DEVICE(ACS_VENDOR_ID, ACR122U_PRODUCT_ID),
 	  .driver_info = PN533_DEVICE_ACR122U },
+	{ USB_DEVICE(NSR106_VENDOR_ID, NSR106_PRODUCT_ID_B008),
+	  .driver_info = PN533_DEVICE_NSR106 },
+	{ USB_DEVICE(NSR106_VENDOR_ID, NSR106_PRODUCT_ID_B029),
+	  .driver_info = PN533_DEVICE_NSR106 },
+	{ USB_DEVICE(NSR106_VENDOR_ID, NSR106_PRODUCT_ID_B030),
+	  .driver_info = PN533_DEVICE_NSR106 },
+	{ USB_DEVICE(NSR106_VENDOR_ID, NSR106_PRODUCT_ID_B058),
+	  .driver_info = PN533_DEVICE_NSR106 },
 	{ }
 };
 MODULE_DEVICE_TABLE(usb, pn533_usb_table);
+
+/* NSR106 frames encapsulate PN532 commands and append APDU status to replies. */
+
+#define NSR106_TX_FRAME_HEADER_LEN \
+	(sizeof(struct pn533_nsr106_tx_frame) + 1) /* +1 for cmd_code in data[0] */
+#define NSR106_TX_FRAME_TAIL_LEN   2 /* checksum + end marker */
+#define NSR106_RX_FRAME_HEADER_LEN \
+	(sizeof(struct pn533_nsr106_rx_frame) + 1) /* +1 for cmd+1 in data[0] */
+#define NSR106_RX_FRAME_TAIL_LEN   4 /* APDU SW(2) + checksum(1) + end marker(1) */
+#define NSR106_MAX_PAYLOAD_LEN \
+	(NSR106_FRAME_SIZE - NSR106_TX_FRAME_HEADER_LEN - NSR106_TX_FRAME_TAIL_LEN)
+
+struct pn533_nsr106_tx_frame {
+	u8 type;        /* 0x01 = host→device command */
+	u8 len;         /* total frame length */
+	__le16 seq;     /* sequence counter */
+	u8 preamble;    /* 0xFF */
+	u8 reserved[3]; /* 0x00 */
+	u8 pn532_len;   /* PN532 content length: TFI(1) + cmd(1) + params */
+	u8 tfi;         /* 0xD4 = host→device TFI */
+	u8 data[];      /* data[0] = cmd_code, data[1..] = parameters */
+} __packed;
+
+struct pn533_nsr106_rx_frame {
+	u8 type;        /* 0x02 = device→host response */
+	u8 len;         /* total frame length */
+	__le16 seq;     /* echo of request sequence */
+	u8 tfi;         /* 0xD5 = device→host TFI */
+	u8 data[];      /* data[0] = cmd+1, then payload, APDU SW, checksum, 0xFD */
+} __packed;
 
 struct pn533_usb_phy {
 	struct usb_device *udev;
@@ -52,6 +99,8 @@ struct pn533_usb_phy {
 
 	struct urb *ack_urb;
 	u8 *ack_buffer;
+
+	u16 nsr106_seq;    /* TX sequence counter, incremented by 2 per frame */
 
 	struct pn533 *priv;
 };
@@ -162,6 +211,7 @@ static int pn533_usb_send_frame(struct pn533 *dev,
 				struct sk_buff *out)
 {
 	struct pn533_usb_phy *phy = dev->phy;
+	struct pn533_nsr106_tx_frame *nsr106_tx = NULL;
 	struct pn533_out_arg arg;
 	void *cntx;
 	int rc;
@@ -169,8 +219,40 @@ static int pn533_usb_send_frame(struct pn533 *dev,
 	if (phy->priv == NULL)
 		phy->priv = dev;
 
-	phy->out_urb->transfer_buffer = out->data;
-	phy->out_urb->transfer_buffer_length = out->len;
+	if (dev->device_type == PN533_DEVICE_NSR106) {
+		/*
+		 * Copy the variable-length sk_buff into a kmalloc'd buffer
+		 * (DMA-safe), zero-padded to the transfer size.
+		 */
+		u8 flen, cksum;
+		int i;
+
+		if (WARN_ON(out->len > NSR106_FRAME_SIZE))
+			return -EMSGSIZE;
+
+		nsr106_tx = kzalloc(NSR106_FRAME_SIZE, GFP_KERNEL);
+		if (!nsr106_tx)
+			return -ENOMEM;
+
+		memcpy(nsr106_tx, out->data, out->len);
+
+		/* Stamp per-transfer sequence counter (incremented by 2 per frame) */
+		nsr106_tx->seq = cpu_to_le16(phy->nsr106_seq);
+		phy->nsr106_seq += 2;
+
+		/* Recompute checksum after modifying seq */
+		flen  = nsr106_tx->len;
+		cksum = 0;
+		for (i = 0; i < flen - 2; i++)
+			cksum += ((u8 *)nsr106_tx)[i];
+		((u8 *)nsr106_tx)[flen - 2] = cksum ^ 0xFF;
+
+		phy->out_urb->transfer_buffer = nsr106_tx;
+		phy->out_urb->transfer_buffer_length = NSR106_FRAME_SIZE;
+	} else {
+		phy->out_urb->transfer_buffer = out->data;
+		phy->out_urb->transfer_buffer_length = out->len;
+	}
 
 	print_hex_dump_debug("PN533 TX: ", DUMP_PREFIX_NONE, 16, 1,
 			     out->data, out->len, false);
@@ -181,10 +263,13 @@ static int pn533_usb_send_frame(struct pn533 *dev,
 	phy->out_urb->context = &arg;
 
 	rc = usb_submit_urb(phy->out_urb, GFP_KERNEL);
-	if (rc)
+	if (rc) {
+		kfree(nsr106_tx);
 		return rc;
+	}
 
 	wait_for_completion(&arg.done);
+	kfree(nsr106_tx);
 	phy->out_urb->context = cntx;
 
 	if (dev->protocol_type == PN533_PROTO_REQ_RESP) {
@@ -210,12 +295,12 @@ static void pn533_usb_abort_cmd(struct pn533 *dev, gfp_t flags)
 {
 	struct pn533_usb_phy *phy = dev->phy;
 
-	/* ACR122U does not support any command which aborts last
-	 * issued command i.e. as ACK for standard PN533. Additionally,
-	 * it behaves stange, sending broken or incorrect responses,
-	 * when we cancel urb before the chip will send response.
+	/* ACR122U and NSR106 do not support abort commands: they don't have an
+	 * ACK mechanism and behave incorrectly when the in_urb is cancelled
+	 * before the response arrives.
 	 */
-	if (dev->device_type == PN533_DEVICE_ACR122U)
+	if (dev->device_type == PN533_DEVICE_ACR122U ||
+	    dev->device_type == PN533_DEVICE_NSR106)
 		return;
 
 	/* An ack will cancel the last issued command */
@@ -224,6 +309,100 @@ static void pn533_usb_abort_cmd(struct pn533 *dev, gfp_t flags)
 	/* cancel the urb request */
 	usb_kill_urb(phy->in_urb);
 }
+
+static void pn533_nsr106_tx_frame_init(void *_frame, u8 cmd_code)
+{
+	struct pn533_nsr106_tx_frame *frame = _frame;
+
+	frame->type     = 0x01;
+	frame->len      = NSR106_TX_FRAME_HEADER_LEN + NSR106_TX_FRAME_TAIL_LEN;
+	frame->seq      = 0;
+	frame->preamble = 0xFF;
+	memset(frame->reserved, 0, sizeof(frame->reserved));
+	frame->pn532_len = 2; /* TFI + cmd_code */
+	frame->tfi      = PN533_STD_FRAME_DIR_OUT;
+	frame->data[0]  = cmd_code;
+}
+
+static void pn533_nsr106_tx_frame_finish(void *_frame)
+{
+	struct pn533_nsr106_tx_frame *frame = _frame;
+	u8 *buf = _frame;
+	u8 len = frame->len;
+	u8 cksum = 0;
+	int i;
+
+	for (i = 0; i < len - 2; i++)
+		cksum += buf[i];
+	buf[len - 2] = cksum ^ 0xFF;
+	buf[len - 1] = 0xFE;
+}
+
+static void pn533_nsr106_tx_update_payload_len(void *_frame, int len)
+{
+	struct pn533_nsr106_tx_frame *frame = _frame;
+
+	frame->len      += len;
+	frame->pn532_len += len;
+}
+
+static bool pn533_nsr106_is_rx_frame_valid(void *_frame, struct pn533 *dev)
+{
+	struct pn533_nsr106_rx_frame *frame = _frame;
+	u8 *buf = _frame;
+	u8 len = frame->len;
+	u8 cksum = 0;
+	int i;
+
+	if (frame->type != 0x02)
+		return false;
+
+	if (frame->tfi != PN533_STD_FRAME_DIR_IN)
+		return false;
+
+	if (len < NSR106_RX_FRAME_HEADER_LEN + NSR106_RX_FRAME_TAIL_LEN)
+		return false;
+
+	if (buf[len - 1] != 0xFD)
+		return false;
+
+	for (i = 0; i < len - 2; i++)
+		cksum += buf[i];
+	if ((cksum ^ 0xFF) != buf[len - 2])
+		return false;
+
+	return true;
+}
+
+static int pn533_nsr106_rx_frame_size(void *_frame)
+{
+	struct pn533_nsr106_rx_frame *frame = _frame;
+
+	return frame->len;
+}
+
+static u8 pn533_nsr106_get_cmd_code(void *_frame)
+{
+	struct pn533_nsr106_rx_frame *frame = _frame;
+
+	return frame->data[0]; /* response command = sent_cmd + 1 */
+}
+
+static struct pn533_frame_ops pn533_nsr106_frame_ops = {
+	.tx_frame_init          = pn533_nsr106_tx_frame_init,
+	.tx_frame_finish        = pn533_nsr106_tx_frame_finish,
+	.tx_update_payload_len  = pn533_nsr106_tx_update_payload_len,
+	.tx_header_len          = NSR106_TX_FRAME_HEADER_LEN,
+	.tx_tail_len            = NSR106_TX_FRAME_TAIL_LEN,
+
+	.rx_is_frame_valid      = pn533_nsr106_is_rx_frame_valid,
+	.rx_header_len          = NSR106_RX_FRAME_HEADER_LEN,
+	.rx_tail_len            = NSR106_RX_FRAME_TAIL_LEN,
+	.rx_frame_size          = pn533_nsr106_rx_frame_size,
+
+	.max_payload_len        = NSR106_MAX_PAYLOAD_LEN,
+	.get_cmd_code           = pn533_nsr106_get_cmd_code,
+};
 
 /* ACR122 specific structs and functions */
 
@@ -488,6 +667,14 @@ static int pn533_usb_probe(struct usb_interface *interface,
 			 PN533_STD_FRAME_TAIL_LEN;
 	int rc;
 
+	/*
+	 * The NSR106 is a composite device (HID NFC + mass storage).
+	 * Only claim the HID interface.
+	 */
+	if (id->driver_info == PN533_DEVICE_NSR106 &&
+	    interface->cur_altsetting->desc.bInterfaceClass != USB_CLASS_HID)
+		return -ENODEV;
+
 	phy = devm_kzalloc(&interface->dev, sizeof(*phy), GFP_KERNEL);
 	if (!phy)
 		return -ENOMEM;
@@ -499,14 +686,6 @@ static int pn533_usb_probe(struct usb_interface *interface,
 	phy->udev = interface_to_usbdev(interface);
 	phy->interface = interface;
 
-	rc = usb_find_common_endpoints(interface->cur_altsetting, &ep_in,
-				       &ep_out, NULL, NULL);
-	if (rc) {
-		nfc_err(&interface->dev,
-			"Could not find bulk-in or bulk-out endpoint\n");
-		goto error;
-	}
-
 	phy->in_urb = usb_alloc_urb(0, GFP_KERNEL);
 	phy->out_urb = usb_alloc_urb(0, GFP_KERNEL);
 	phy->ack_urb = usb_alloc_urb(0, GFP_KERNEL);
@@ -516,16 +695,56 @@ static int pn533_usb_probe(struct usb_interface *interface,
 		goto error;
 	}
 
-	usb_fill_bulk_urb(phy->in_urb, phy->udev,
-			  usb_rcvbulkpipe(phy->udev, usb_endpoint_num(ep_in)),
-			  in_buf, in_buf_len, NULL, phy);
+	if (id->driver_info == PN533_DEVICE_NSR106) {
+		struct usb_endpoint_descriptor *ep_in_int, *ep_out_int;
 
-	usb_fill_bulk_urb(phy->out_urb, phy->udev,
-			  usb_sndbulkpipe(phy->udev, usb_endpoint_num(ep_out)),
-			  NULL, 0, pn533_out_complete, phy);
-	usb_fill_bulk_urb(phy->ack_urb, phy->udev,
-			  usb_sndbulkpipe(phy->udev, usb_endpoint_num(ep_out)),
-			  NULL, 0, pn533_ack_complete, phy);
+		rc = usb_find_common_endpoints(interface->cur_altsetting,
+					       NULL, NULL,
+					       &ep_in_int, &ep_out_int);
+		if (rc) {
+			nfc_err(&interface->dev,
+				"Could not find interrupt endpoints\n");
+			goto error;
+		}
+
+		usb_fill_int_urb(phy->in_urb, phy->udev,
+				 usb_rcvintpipe(phy->udev,
+						usb_endpoint_num(ep_in_int)),
+				 in_buf, NSR106_FRAME_SIZE,
+				 NULL, phy, ep_in_int->bInterval);
+		usb_fill_int_urb(phy->out_urb, phy->udev,
+				 usb_sndintpipe(phy->udev,
+						usb_endpoint_num(ep_out_int)),
+				 NULL, 0, pn533_out_complete, phy,
+				 ep_out_int->bInterval);
+		usb_fill_int_urb(phy->ack_urb, phy->udev,
+				 usb_sndintpipe(phy->udev,
+						usb_endpoint_num(ep_out_int)),
+				 NULL, 0, pn533_ack_complete, phy,
+				 ep_out_int->bInterval);
+
+	} else {
+		rc = usb_find_common_endpoints(interface->cur_altsetting,
+					       &ep_in, &ep_out, NULL, NULL);
+		if (rc) {
+			nfc_err(&interface->dev,
+				"Could not find bulk-in or bulk-out endpoint\n");
+			goto error;
+		}
+
+		usb_fill_bulk_urb(phy->in_urb, phy->udev,
+				  usb_rcvbulkpipe(phy->udev,
+						  usb_endpoint_num(ep_in)),
+				  in_buf, in_buf_len, NULL, phy);
+		usb_fill_bulk_urb(phy->out_urb, phy->udev,
+				  usb_sndbulkpipe(phy->udev,
+						  usb_endpoint_num(ep_out)),
+				  NULL, 0, pn533_out_complete, phy);
+		usb_fill_bulk_urb(phy->ack_urb, phy->udev,
+				  usb_sndbulkpipe(phy->udev,
+						  usb_endpoint_num(ep_out)),
+				  NULL, 0, pn533_ack_complete, phy);
+	}
 
 	switch (id->driver_info) {
 	case PN533_DEVICE_STD:
@@ -547,6 +766,12 @@ static int pn533_usb_probe(struct usb_interface *interface,
 				"Couldn't poweron the reader (error %d)\n", rc);
 			goto error;
 		}
+		break;
+
+	case PN533_DEVICE_NSR106:
+		protocols = PN533_ALL_PROTOCOLS;
+		fops = &pn533_nsr106_frame_ops;
+		protocol_type = PN533_PROTO_REQ_RESP;
 		break;
 
 	default:

@@ -982,17 +982,24 @@ static void pn533_poll_create_mod_list(struct pn533 *dev,
 	    (im_protocols & NFC_PROTO_NFC_DEP_MASK))
 		pn533_poll_add_mod(dev, PN533_POLL_MOD_106KBPS_A);
 
-	if (im_protocols & NFC_PROTO_FELICA_MASK ||
-	    im_protocols & NFC_PROTO_NFC_DEP_MASK) {
-		pn533_poll_add_mod(dev, PN533_POLL_MOD_212KBPS_FELICA);
-		pn533_poll_add_mod(dev, PN533_POLL_MOD_424KBPS_FELICA);
+	/*
+	 * The NSR106 bridge doesn't support RFConfiguration's Timing item
+	 * (0x02), so initiator modulations that get no reply never time out.
+	 * Restrict initiator polling to 106 kbps type A/MIFARE.
+	 */
+	if (dev->device_type != PN533_DEVICE_NSR106) {
+		if (im_protocols & NFC_PROTO_FELICA_MASK ||
+		    im_protocols & NFC_PROTO_NFC_DEP_MASK) {
+			pn533_poll_add_mod(dev, PN533_POLL_MOD_212KBPS_FELICA);
+			pn533_poll_add_mod(dev, PN533_POLL_MOD_424KBPS_FELICA);
+		}
+
+		if (im_protocols & NFC_PROTO_JEWEL_MASK)
+			pn533_poll_add_mod(dev, PN533_POLL_MOD_106KBPS_JEWEL);
+
+		if (im_protocols & NFC_PROTO_ISO14443_B_MASK)
+			pn533_poll_add_mod(dev, PN533_POLL_MOD_847KBPS_B);
 	}
-
-	if (im_protocols & NFC_PROTO_JEWEL_MASK)
-		pn533_poll_add_mod(dev, PN533_POLL_MOD_106KBPS_JEWEL);
-
-	if (im_protocols & NFC_PROTO_ISO14443_B_MASK)
-		pn533_poll_add_mod(dev, PN533_POLL_MOD_847KBPS_B);
 
 	if (tm_protocols)
 		pn533_poll_add_mod(dev, PN533_LISTEN_MOD);
@@ -2675,6 +2682,7 @@ static int pn533_setup(struct pn533 *dev)
 	case PN533_DEVICE_ACR122U:
 	case PN533_DEVICE_PN532:
 	case PN533_DEVICE_PN532_AUTOPOLL:
+	case PN533_DEVICE_NSR106:
 		max_retries.mx_rty_atr = 0x2;
 		max_retries.mx_rty_psl = 0x1;
 		max_retries.mx_rty_passive_act =
@@ -2701,17 +2709,21 @@ static int pn533_setup(struct pn533 *dev)
 	}
 
 
-	rc = pn533_set_configuration(dev, PN533_CFGITEM_TIMING,
-				     (u8 *)&timing, sizeof(timing));
-	if (rc) {
-		nfc_err(dev->dev, "Error on setting RF timings\n");
-		return rc;
+	/* NSR106 does not support RFConfiguration 0x02 (Timing) */
+	if (dev->device_type != PN533_DEVICE_NSR106) {
+		rc = pn533_set_configuration(dev, PN533_CFGITEM_TIMING,
+					     (u8 *)&timing, sizeof(timing));
+		if (rc) {
+			nfc_err(dev->dev, "Error on setting RF timings\n");
+			return rc;
+		}
 	}
 
 	switch (dev->device_type) {
 	case PN533_DEVICE_STD:
 	case PN533_DEVICE_PN532:
 	case PN533_DEVICE_PN532_AUTOPOLL:
+	case PN533_DEVICE_NSR106:
 		break;
 
 	case PN533_DEVICE_PASORI:
